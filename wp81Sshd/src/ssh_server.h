@@ -125,6 +125,7 @@ typedef struct SshSession {
     const HostKey *host_key;
     wchar_t  authorized_keys_path[MAX_PATH];
     wchar_t  shell_command[MAX_PATH];
+    wchar_t  home_dir[MAX_PATH];     /* base of relative paths for scp / sftp */
 
     char     user[64];               /* authenticated user name */
 

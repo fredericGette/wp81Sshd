@@ -16,12 +16,19 @@
  * cmd.exe echoes every line it reads from a pipe, so that echo is filtered
  * out of its output.  The current directory used for completion is taken
  * from the last prompt cmd printed ("C:\Data>").
+ *
+ * Instead of a shell, the channel can carry a file transfer (ssh_files.cpp):
+ * the "sftp" subsystem, or an "scp -t/-f" exec request.  Its data is queued
+ * by the session thread and consumed by a worker thread, which re-opens the
+ * receive window only once the data is processed (so the queue never holds
+ * more than LOCAL_WINDOW_SIZE bytes) and can block on the send window.
  */
 
 #include "ssh_server.h"
 #include "ssh_transport.h"
 #include "ssh_kex_server.h"
 #include "ssh_auth_server.h"
+#include "ssh_files.h"
 #include "base64.h"
 #include "log.h"
 #include "crypto/sha256.h"
@@ -42,6 +49,11 @@
 #define COMP_MAX             256           /* completion candidates kept */
 #define COMP_ARENA           (16 * 1024)   /* bytes for their UTF-8 names */
 #define OUT_LINE_MAX         (MAX_PATH + 8)
+#define EXEC_CMD_MAX         2048
+#define XFER_STACK_SIZE      (4 * 1024 * 1024)
+#ifndef STACK_SIZE_PARAM_IS_A_RESERVATION
+#define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000
+#endif
 
 /* Serialises "create inheritable pipes + CreateProcess" across sessions,
  * so a child never inherits another session's pipe ends. */
@@ -118,6 +130,17 @@ typedef struct {
 	char       out_line[OUT_LINE_MAX]; /* last (partial) output line: the prompt */
 	size_t     out_line_len;
 	int        out_line_overflow;
+
+	/* file transfer (sftp subsystem / scp exec) */
+	int        xfer;                 /* 1 sftp, 2 scp; 0: shell or nothing yet */
+	char      *xfer_cmd;             /* scp command line */
+	HANDLE     hWorker;
+	CRITICAL_SECTION q_lock;
+	HANDLE     q_event;              /* auto-reset: data, EOF or closing */
+	uint8_t   *q_buf;                /* ring buffer of LOCAL_WINDOW_SIZE bytes */
+	size_t     q_head, q_len;
+	int        q_eof;
+	uint32_t   q_consumed;           /* bytes processed since last WINDOW_ADJUST (worker) */
 } Channel;
 
 /* ================================================================== helpers */
@@ -249,6 +272,144 @@ static void channel_echo(Channel *c, const char *data, size_t len)
 {
 	if (c->pty && len > 0)
 		channel_send_some(c, (const uint8_t *)data, len);
+}
+
+static void channel_send_exit_status(Channel *c, uint32_t code)
+{
+	uint8_t pkt[64];
+	size_t  off = 0;
+	buf_put_byte(pkt, sizeof(pkt), &off, SSH_MSG_CHANNEL_REQUEST);
+	buf_put_u32_at(pkt, sizeof(pkt), &off, c->remote_id);
+	buf_put_cstring(pkt, sizeof(pkt), &off, "exit-status");
+	buf_put_byte(pkt, sizeof(pkt), &off, 0);
+	buf_put_u32_at(pkt, sizeof(pkt), &off, code);
+	EnterCriticalSection(&c->s->send_lock);
+	if (!c->close_sent) ssh_send_packet(c->s, pkt, off);
+	LeaveCriticalSection(&c->s->send_lock);
+}
+
+/* ================================================================== file transfer */
+
+/* Session thread: queue received data for the worker.  -1 if the client
+ * overran the window it was given. */
+static int xfer_queue_push(Channel *c, const uint8_t *data, size_t len)
+{
+	int rc = 0;
+	EnterCriticalSection(&c->q_lock);
+	if (c->q_len + len > LOCAL_WINDOW_SIZE) {
+		rc = -1;
+	} else {
+		size_t tail = (c->q_head + c->q_len) % LOCAL_WINDOW_SIZE;
+		size_t first = LOCAL_WINDOW_SIZE - tail;
+		if (first > len) first = len;
+		memcpy(c->q_buf + tail, data, first);
+		memcpy(c->q_buf, data + first, len - first);
+		c->q_len += len;
+	}
+	LeaveCriticalSection(&c->q_lock);
+	SetEvent(c->q_event);
+	return rc;
+}
+
+static void xfer_queue_eof(Channel *c)
+{
+	EnterCriticalSection(&c->q_lock);
+	c->q_eof = 1;
+	LeaveCriticalSection(&c->q_lock);
+	SetEvent(c->q_event);
+}
+
+/* XferIO.recv (worker thread) */
+static int xfer_recv(void *ctx, uint8_t *buf, size_t len)
+{
+	Channel *c = (Channel *)ctx;
+	size_t   n, first;
+	int      rc = 0;
+
+	for (;;) {
+		if (c->s->closing) return -1;
+		EnterCriticalSection(&c->q_lock);
+		if (c->q_len > 0) break;
+		if (c->q_eof) {
+			LeaveCriticalSection(&c->q_lock);
+			return 0;
+		}
+		LeaveCriticalSection(&c->q_lock);
+		api.WaitForSingleObject(c->q_event, 1000);
+	}
+	n = len < c->q_len ? len : c->q_len;
+	first = LOCAL_WINDOW_SIZE - c->q_head;
+	if (first > n) first = n;
+	memcpy(buf, c->q_buf + c->q_head, first);
+	memcpy(buf + first, c->q_buf, n - first);
+	c->q_head = (c->q_head + n) % LOCAL_WINDOW_SIZE;
+	c->q_len -= n;
+	LeaveCriticalSection(&c->q_lock);
+
+	/* Give the client room again once half of the window is processed */
+	c->q_consumed += (uint32_t)n;
+	if (c->q_consumed >= LOCAL_WINDOW_SIZE / 2) {
+		uint8_t pkt[9];
+		size_t  off = 0;
+		buf_put_byte(pkt, sizeof(pkt), &off, SSH_MSG_CHANNEL_WINDOW_ADJUST);
+		buf_put_u32_at(pkt, sizeof(pkt), &off, c->remote_id);
+		buf_put_u32_at(pkt, sizeof(pkt), &off, c->q_consumed);
+		c->q_consumed = 0;
+		EnterCriticalSection(&c->s->send_lock);
+		if (!c->close_sent) rc = ssh_send_packet(c->s, pkt, off);
+		LeaveCriticalSection(&c->s->send_lock);
+		if (rc != 0) return -1;
+	}
+	return (int)n;
+}
+
+/* XferIO.send (worker thread) */
+static int xfer_send(void *ctx, const uint8_t *buf, size_t len)
+{
+	return channel_send_all((Channel *)ctx, buf, len);
+}
+
+static DWORD WINAPI xfer_thread(LPVOID param)
+{
+	Channel *c = (Channel *)param;
+	XferIO   io;
+	int      status;
+
+	io.ctx = c;
+	io.session_id = c->s->id;
+	io.recv = xfer_recv;
+	io.send = xfer_send;
+
+	if (c->xfer == 1) status = sftp_server_run(&io, c->s->home_dir);
+	else status = scp_server_run(&io, c->xfer_cmd, c->s->home_dir);
+
+	if (c->s->closing) return 0;
+	channel_send_exit_status(c, (uint32_t)status);
+	channel_send_close(c);
+	return 0;
+}
+
+/* Allocate the input queue; from now on channel data goes to it. */
+static int xfer_prepare(Channel *c, int kind, const char *cmd)
+{
+	if (!c->q_buf) c->q_buf = (uint8_t *)malloc(LOCAL_WINDOW_SIZE);
+	if (!c->q_event) c->q_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (cmd && !c->xfer_cmd) c->xfer_cmd = _strdup(cmd);
+	if (!c->q_buf || !c->q_event || (cmd && !c->xfer_cmd)) return -1;
+	c->xfer = kind;
+	return 0;
+}
+
+/* Start the worker (after the request was answered).  The stack is a large
+ * reservation because "scp -r" recurses once per directory level. */
+static int xfer_launch(Channel *c)
+{
+	c->hWorker = CreateThread(NULL, XFER_STACK_SIZE, xfer_thread, c, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+	if (!c->hWorker) {
+		LOGF(TRACE_LEVEL_ERROR, "[%u] CreateThread (transfer) failed: %lu", c->s->id, GetLastError());
+		return -1;
+	}
+	return 0;
 }
 
 /* ================================================================== shell process */
@@ -477,18 +638,7 @@ static DWORD WINAPI pump_thread(LPVOID param)
 	LOGF(TRACE_LEVEL_INFORMATION, "[%u] shell exited with code %lu", c->s->id, exit_code);
 
 	/* exit-status, then EOF + CLOSE */
-	if (exited) {
-		uint8_t pkt[64];
-		size_t  off = 0;
-		buf_put_byte(pkt, sizeof(pkt), &off, SSH_MSG_CHANNEL_REQUEST);
-		buf_put_u32_at(pkt, sizeof(pkt), &off, c->remote_id);
-		buf_put_cstring(pkt, sizeof(pkt), &off, "exit-status");
-		buf_put_byte(pkt, sizeof(pkt), &off, 0);
-		buf_put_u32_at(pkt, sizeof(pkt), &off, exit_code);
-		EnterCriticalSection(&c->s->send_lock);
-		if (!c->close_sent) ssh_send_packet(c->s, pkt, off);
-		LeaveCriticalSection(&c->s->send_lock);
-	}
+	if (exited) channel_send_exit_status(c, exit_code);
 	channel_send_close(c);
 	return 0;
 }
@@ -1105,8 +1255,36 @@ static int handle_channel_request(Channel *c, const uint8_t *buf, size_t len)
 		return want_reply ? send_request_reply(c, 1) : 0;
 	}
 
+	if (buf_eq(type, type_len, "subsystem") || buf_eq(type, type_len, "exec")) {
+		const uint8_t *arg;
+		size_t         arg_len;
+		char           cmd[EXEC_CMD_MAX];
+		int            ok = 0, is_exec = buf_eq(type, type_len, "exec");
+
+		if (buf_get_string(buf, len, &off, &arg, &arg_len) != 0) return -1;
+		if (arg_len >= sizeof(cmd) || memchr(arg, 0, arg_len)) arg_len = 0;
+		memcpy(cmd, arg, arg_len);
+		cmd[arg_len] = '\0';
+
+		if (!c->shell_started && !c->xfer) {
+			if (!is_exec && strcmp(cmd, "sftp") == 0)
+				ok = xfer_prepare(c, 1, NULL) == 0;
+			else if (is_exec && scp_is_command(cmd))
+				ok = xfer_prepare(c, 2, cmd) == 0;
+			if (!ok) c->xfer = 0;
+		}
+		if (!ok)
+			LOGF(TRACE_LEVEL_INFORMATION, "[%u] declined %s '%s'", c->s->id, is_exec ? "exec" : "subsystem", cmd);
+		if (want_reply && send_request_reply(c, ok) != 0) return -1;
+		if (ok && xfer_launch(c) != 0) {
+			channel_send_close(c);
+			return 0;
+		}
+		return 0;
+	}
+
 	if (buf_eq(type, type_len, "shell")) {
-		int ok = !c->shell_started && shell_spawn(c) == 0;
+		int ok = !c->shell_started && !c->xfer && shell_spawn(c) == 0;
 		if (want_reply && send_request_reply(c, ok) != 0) return -1;
 		if (ok) {
 			c->hPump = CreateThread(NULL, 0, pump_thread, c, 0, NULL);
@@ -1135,6 +1313,16 @@ static int handle_channel_data(Channel *c, const uint8_t *buf, size_t len, int e
 	if (extended && buf_get_u32_at(buf, len, &off, &data_type) != 0) return -1;
 	if (buf_get_string(buf, len, &off, &data, &data_len) != 0) return -1;
 	if (!c->open) return -1;
+
+	if (c->xfer) {
+		/* The worker re-opens the window as it consumes the data */
+		if (extended) return 0;
+		if (xfer_queue_push(c, data, data_len) != 0) {
+			LOGF(TRACE_LEVEL_WARNING, "[%u] client exceeded the channel window", c->s->id);
+			return -1;
+		}
+		return 0;
+	}
 
 	if (!extended) handle_input(c, data, data_len);
 
@@ -1208,7 +1396,8 @@ static void connection_loop(Channel *c, uint8_t *buf, size_t buf_size)
 			break;
 
 		case SSH_MSG_CHANNEL_EOF:
-			shell_close_stdin(c);
+			if (c->xfer) xfer_queue_eof(c);
+			else shell_close_stdin(c);
 			break;
 
 		case SSH_MSG_CHANNEL_CLOSE:
@@ -1268,6 +1457,7 @@ void ssh_session_run(SshSession *s)
 	c->s = s;
 	c->window_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 	InitializeCriticalSectionEx(&c->echo_lock, 0, 0);
+	InitializeCriticalSectionEx(&c->q_lock, 0, 0);
 
 	/* Pre-authentication: every read must complete within the timeout */
 	set_recv_timeout(s->sock, PREAUTH_TIMEOUT_MS);
@@ -1287,6 +1477,7 @@ done:
 	/* Stop the pump and the shell */
 	InterlockedExchange(&s->closing, 1);
 	if (c->window_event) SetEvent(c->window_event);
+	if (c->q_event) SetEvent(c->q_event);
 
 	if (c->hProcess && api.WaitForSingleObject(c->hProcess, 0) == WAIT_TIMEOUT) {
 		LOGF(TRACE_LEVEL_INFORMATION, "[%u] terminating shell", s->id);
@@ -1300,6 +1491,20 @@ done:
 		api.WaitForSingleObject(c->hPump, 5000);
 		CloseHandle(c->hPump);
 	}
+	if (c->hWorker) {
+		if (api.WaitForSingleObject(c->hWorker, 10000) == WAIT_TIMEOUT) {
+			/* Still inside a file operation and using c: leave c allocated */
+			LOGF(TRACE_LEVEL_ERROR, "[%u] transfer thread does not stop; leaking its state", s->id);
+			CloseHandle(c->hWorker);
+			free(buf);
+			return;
+		}
+		CloseHandle(c->hWorker);
+	}
+	if (c->q_event) CloseHandle(c->q_event);
+	free(c->q_buf);
+	free(c->xfer_cmd);
+	DeleteCriticalSection(&c->q_lock);
 	shell_close_stdin(c);
 	if (c->hStdoutRd) CloseHandle(c->hStdoutRd);
 	if (c->hProcess) CloseHandle(c->hProcess);

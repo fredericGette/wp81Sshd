@@ -33,6 +33,7 @@ static const DWORD    DEFAULT_MAX_SESSIONS = 4;
 static const DWORD    MAX_MAX_SESSIONS     = 16;
 static const wchar_t* DEFAULT_AUTHORIZED_KEYS = L"C:\\Data\\USERS\\Public\\Documents\\wp81Sshd\\authorized_keys";
 static const wchar_t* DEFAULT_SHELL           = L"C:\\Windows\\System32\\cmd.exe";
+static const wchar_t* DEFAULT_HOME            = L"C:\\Data\\USERS\\Public\\Documents";
 // ─────────────────────────────────────────────────────────────────────────────
 
 Win32Api api;
@@ -187,6 +188,7 @@ static bool RunServer(HANDLE stopEvent)
     bool     created = false;
     wchar_t  authorizedKeys[MAX_PATH];
     wchar_t  shell[MAX_PATH];
+    wchar_t  home[MAX_PATH];
     wchar_t  listenAddress[64];
     in_addr  bindAddr;
     WSADATA  wsa;
@@ -199,6 +201,7 @@ static bool RunServer(HANDLE stopEvent)
     if (maxSessions > MAX_MAX_SESSIONS) maxSessions = MAX_MAX_SESSIONS;
     Config::ReadString(L"AuthorizedKeysFile", authorizedKeys, _countof(authorizedKeys), DEFAULT_AUTHORIZED_KEYS);
     Config::ReadString(L"ShellCommand", shell, _countof(shell), DEFAULT_SHELL);
+    Config::ReadString(L"HomeDirectory", home, _countof(home), DEFAULT_HOME);
     Config::ReadString(L"ListenAddress", listenAddress, _countof(listenAddress), L"0.0.0.0");
     if (!ParseIPv4(listenAddress, &bindAddr))
     {
@@ -315,6 +318,7 @@ static bool RunServer(HANDLE stopEvent)
                 s->host_key = &hostKey;
                 StringCchCopyW(s->authorized_keys_path, _countof(s->authorized_keys_path), authorizedKeys);
                 StringCchCopyW(s->shell_command, _countof(s->shell_command), shell);
+                StringCchCopyW(s->home_dir, _countof(s->home_dir), home);
 
                 EnterCriticalSection(&g_slotsLock);
                 DWORD slot = 0;

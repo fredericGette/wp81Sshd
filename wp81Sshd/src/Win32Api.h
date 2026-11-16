@@ -171,6 +171,19 @@ typedef struct _PROCESS_INFORMATION {
 
 DECLARE_HANDLE(SC_HANDLE);
 
+typedef struct _BY_HANDLE_FILE_INFORMATION {
+	DWORD dwFileAttributes;
+	FILETIME ftCreationTime;
+	FILETIME ftLastAccessTime;
+	FILETIME ftLastWriteTime;
+	DWORD dwVolumeSerialNumber;
+	DWORD nFileSizeHigh;
+	DWORD nFileSizeLow;
+	DWORD nNumberOfLinks;
+	DWORD nFileIndexHigh;
+	DWORD nFileIndexLow;
+} BY_HANDLE_FILE_INFORMATION, *PBY_HANDLE_FILE_INFORMATION, *LPBY_HANDLE_FILE_INFORMATION;
+
 #define HANDLE_FLAG_INHERIT 0x00000001
 
 typedef VOID(WINAPI *LPSERVICE_MAIN_FUNCTIONW)(
@@ -235,6 +248,8 @@ extern "C" {
 	WINBASEAPI BOOL WINAPI SetHandleInformation(HANDLE hObject, DWORD dwMask, DWORD dwFlags);
 	WINBASEAPI BOOL WINAPI PeekNamedPipe(HANDLE hNamedPipe, LPVOID lpBuffer, DWORD nBufferSize, LPDWORD lpBytesRead, LPDWORD lpTotalBytesAvail, LPDWORD lpBytesLeftThisMessage);
 	WINBASEAPI HANDLE WINAPI GetStdHandle(DWORD nStdHandle);
+	WINBASEAPI BOOL WINAPI GetFileInformationByHandle(HANDLE hFile, LPBY_HANDLE_FILE_INFORMATION lpFileInformation);
+	WINBASEAPI BOOL WINAPI SetFileTime(HANDLE hFile, CONST FILETIME *lpCreationTime, CONST FILETIME *lpLastAccessTime, CONST FILETIME *lpLastWriteTime);
 	WINADVAPI BOOL WINAPI CryptAcquireContextA(HCRYPTPROV *phProv, LPCSTR szContainer, LPCSTR szProvider, DWORD dwProvType, DWORD dwFlags);
 	WINADVAPI BOOL WINAPI CryptGenRandom(HCRYPTPROV hProv, DWORD dwLen, BYTE *pbBuffer);
 	WINADVAPI BOOL WINAPI CryptReleaseContext(HCRYPTPROV hProv, DWORD dwFlags);
