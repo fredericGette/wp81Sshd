@@ -10,9 +10,12 @@
  *
  * Windows Phone 8.1 has no pseudo console, so the shell runs on plain pipes.
  * When the client requests a PTY, a small line discipline runs here:
- * local echo, backspace, Ctrl-U, Ctrl-C (discard line), Ctrl-D (EOF), and
- * escape sequences (arrow keys...) are swallowed.  cmd.exe echoes every line
- * it reads from a pipe, so that echo is filtered out of its output.
+ * local echo, cursor movement (Left/Right/Home/End, Ctrl-A/Ctrl-E),
+ * Backspace/Delete, Ctrl-U, Ctrl-C (discard line), Ctrl-D (EOF), command
+ * history (Up/Down) and cmd.exe-style Tab / Shift-Tab file name completion.
+ * cmd.exe echoes every line it reads from a pipe, so that echo is filtered
+ * out of its output.  The current directory used for completion is taken
+ * from the last prompt cmd printed ("C:\Data>").
  */
 
 #include "ssh_server.h"
@@ -35,6 +38,10 @@
 #define ECHO_HOLD_MS         500
 #define PUMP_POLL_MS         30
 #define STDIN_PIPE_SIZE      (64 * 1024)
+#define HIST_MAX             32
+#define COMP_MAX             256           /* completion candidates kept */
+#define COMP_ARENA           (16 * 1024)   /* bytes for their UTF-8 names */
+#define OUT_LINE_MAX         (MAX_PATH + 8)
 
 /* Serialises "create inheritable pipes + CreateProcess" across sessions,
  * so a child never inherits another session's pipe ends. */
@@ -69,8 +76,29 @@ typedef struct {
 	int        pty;
 	char       line[LINE_MAX];
 	size_t     line_len;
+	size_t     cursor;               /* byte offset in line, on a UTF-8 boundary */
 	int        last_was_cr;
 	int        esc_state;            /* 0 none, 1 after ESC, 2 in CSI, 3 in SS3 */
+	int        esc_param;            /* first numeric CSI parameter */
+	int        esc_param_done;       /* a ';' was seen: ignore further digits */
+	char       utf8_pend[4];         /* partial UTF-8 sequence being typed */
+	int        utf8_have, utf8_need;
+
+	/* history (hist[0] is the oldest) */
+	char      *hist[HIST_MAX];
+	int        hist_count;
+	int        hist_pos;             /* == hist_count: editing a new line */
+	char       hist_saved[LINE_MAX]; /* new line put aside while browsing */
+	size_t     hist_saved_len;
+
+	/* Tab completion (cycling through matches) */
+	int        comp_active;
+	int        comp_count, comp_index;
+	int        comp_quote;           /* surround the replacement with quotes */
+	size_t     comp_start, comp_end; /* replaced range in line (comp_end == cursor) */
+	char       comp_dir[LINE_MAX];   /* directory part of the word, unquoted */
+	char      *comp_names[COMP_MAX];
+	char       comp_arena[COMP_ARENA];
 
 	/* shell process */
 	int        shell_started;
@@ -87,6 +115,9 @@ typedef struct {
 	size_t     echo_matched;         /* bytes already swallowed */
 	ULONGLONG  echo_since;           /* when the first byte was swallowed */
 	int        out_last_cr;          /* LF -> CRLF translation state */
+	char       out_line[OUT_LINE_MAX]; /* last (partial) output line: the prompt */
+	size_t     out_line_len;
+	int        out_line_overflow;
 } Channel;
 
 /* ================================================================== helpers */
@@ -323,6 +354,23 @@ static void shell_close_stdin(Channel *c)
 
 /* ================================================================== output pump */
 
+/* Remember the last output line (normally cmd's prompt).  Caller holds echo_lock. */
+static void track_out_line(Channel *c, const char *data, size_t len)
+{
+	size_t i;
+	for (i = 0; i < len; i++) {
+		char ch = data[i];
+		if (ch == '\r' || ch == '\n') {
+			c->out_line_len = 0;
+			c->out_line_overflow = 0;
+		} else if (c->out_line_len < OUT_LINE_MAX - 1) {
+			c->out_line[c->out_line_len++] = ch;
+		} else {
+			c->out_line_overflow = 1;
+		}
+	}
+}
+
 /*
  * Forward output bytes to the client, applying (PTY mode only) the echo
  * filter and LF -> CRLF translation.  Called by the pump thread.
@@ -355,6 +403,7 @@ static int pump_forward(Channel *c, const char *in, size_t len)
 		c->out_last_cr = (ch == '\r');
 		out[n++] = ch;
 	}
+	track_out_line(c, out, n);
 	LeaveCriticalSection(&c->echo_lock);
 
 	return channel_send_all(c, (const uint8_t *)out, n);
@@ -372,6 +421,7 @@ static int pump_flush_stale_echo(Channel *c, int force)
 		memcpy(held, c->echo_expect, c->echo_matched);
 		n = c->echo_matched;
 		c->echo_len = c->echo_matched = 0;
+		track_out_line(c, held, n);
 	}
 	LeaveCriticalSection(&c->echo_lock);
 
@@ -445,9 +495,385 @@ static DWORD WINAPI pump_thread(LPVOID param)
 
 /* ================================================================== input (line discipline) */
 
+/*
+ * Terminal model: the client's cursor sits at column cols(0, cursor) after
+ * the prompt.  Columns are counted as one per code point (UTF-8 lead byte).
+ * Lines longer than the terminal width are not handled specially.
+ */
+
+static size_t line_cols(Channel *c, size_t from, size_t to)
+{
+	size_t n = 0;
+	for (; from < to; from++)
+		if (((unsigned char)c->line[from] & 0xC0) != 0x80) n++;
+	return n;
+}
+
+static size_t line_prev(Channel *c, size_t pos)
+{
+	if (pos == 0) return 0;
+	do {
+		pos--;
+	} while (pos > 0 && ((unsigned char)c->line[pos] & 0xC0) == 0x80);
+	return pos;
+}
+
+static size_t line_next(Channel *c, size_t pos)
+{
+	if (pos >= c->line_len) return c->line_len;
+	do {
+		pos++;
+	} while (pos < c->line_len && ((unsigned char)c->line[pos] & 0xC0) == 0x80);
+	return pos;
+}
+
+static void bell(Channel *c)
+{
+	channel_echo(c, "\a", 1);
+}
+
+/* Move the terminal cursor n columns (negative: left). */
+static void term_move(Channel *c, int n)
+{
+	char seq[16];
+	int  len;
+	if (n == 0) return;
+	len = _snprintf_s(seq, sizeof(seq), _TRUNCATE, "\x1b[%d%c", n < 0 ? -n : n, n < 0 ? 'D' : 'C');
+	if (len > 0) channel_echo(c, seq, (size_t)len);
+}
+
+/*
+ * Redraw line[from..] after a change.  The terminal cursor must be at the
+ * column of `from`; old_cols is the width the text from `from` had before the
+ * change, so leftovers get blanked.  Leaves the terminal cursor at c->cursor
+ * (which must be >= from).
+ */
+static void refresh_tail(Channel *c, size_t from, size_t old_cols)
+{
+	static const char spaces[] = "                                ";
+	size_t new_cols = line_cols(c, from, c->line_len);
+	size_t pad = old_cols > new_cols ? old_cols - new_cols : 0;
+	size_t p;
+
+	channel_echo(c, c->line + from, c->line_len - from);
+	for (p = pad; p > 0; ) {
+		size_t k = p < sizeof(spaces) - 1 ? p : sizeof(spaces) - 1;
+		channel_echo(c, spaces, k);
+		p -= k;
+	}
+	term_move(c, -(int)(pad + line_cols(c, c->cursor, c->line_len)));
+}
+
+/* Replace the whole line (history recall), cursor at the end. */
+static void line_set(Channel *c, const char *text, size_t len)
+{
+	size_t old_cols;
+	if (len > LINE_MAX - 2) len = LINE_MAX - 2;
+	term_move(c, -(int)line_cols(c, 0, c->cursor));
+	old_cols = line_cols(c, 0, c->line_len);
+	memcpy(c->line, text, len);
+	c->line_len = len;
+	c->cursor = len;
+	refresh_tail(c, 0, old_cols);
+}
+
+static void line_insert(Channel *c, const char *s, size_t n)
+{
+	size_t from = c->cursor;
+	size_t old_cols = line_cols(c, from, c->line_len);
+
+	if (c->line_len + n > LINE_MAX - 2) {
+		bell(c);
+		return;
+	}
+	memmove(c->line + from + n, c->line + from, c->line_len - from);
+	memcpy(c->line + from, s, n);
+	c->line_len += n;
+	c->cursor += n;
+	refresh_tail(c, from, old_cols);
+}
+
+static void delete_before_cursor(Channel *c)
+{
+	size_t prev, old_cols;
+	if (c->cursor == 0) return;
+	prev = line_prev(c, c->cursor);
+	old_cols = line_cols(c, prev, c->line_len);
+	term_move(c, -(int)line_cols(c, prev, c->cursor));
+	memmove(c->line + prev, c->line + c->cursor, c->line_len - c->cursor);
+	c->line_len -= c->cursor - prev;
+	c->cursor = prev;
+	refresh_tail(c, prev, old_cols);
+}
+
+static void delete_at_cursor(Channel *c)
+{
+	size_t next, old_cols;
+	if (c->cursor >= c->line_len) return;
+	next = line_next(c, c->cursor);
+	old_cols = line_cols(c, c->cursor, c->line_len);
+	memmove(c->line + c->cursor, c->line + next, c->line_len - next);
+	c->line_len -= next - c->cursor;
+	refresh_tail(c, c->cursor, old_cols);
+}
+
+static void cursor_left(Channel *c)
+{
+	size_t prev = line_prev(c, c->cursor);
+	term_move(c, -(int)line_cols(c, prev, c->cursor));
+	c->cursor = prev;
+}
+
+static void cursor_right(Channel *c)
+{
+	size_t next = line_next(c, c->cursor);
+	term_move(c, (int)line_cols(c, c->cursor, next));
+	c->cursor = next;
+}
+
+static void cursor_home(Channel *c)
+{
+	term_move(c, -(int)line_cols(c, 0, c->cursor));
+	c->cursor = 0;
+}
+
+static void cursor_end(Channel *c)
+{
+	term_move(c, (int)line_cols(c, c->cursor, c->line_len));
+	c->cursor = c->line_len;
+}
+
+/* ------------------------------------------------------------------ history */
+
+static void history_add(Channel *c)
+{
+	char *entry;
+
+	if (c->line_len == 0) return;
+	if (c->hist_count > 0) {
+		const char *last = c->hist[c->hist_count - 1];
+		if (strlen(last) == c->line_len && memcmp(last, c->line, c->line_len) == 0)
+			return;
+	}
+	entry = (char *)malloc(c->line_len + 1);
+	if (!entry) return;
+	memcpy(entry, c->line, c->line_len);
+	entry[c->line_len] = '\0';
+
+	if (c->hist_count == HIST_MAX) {
+		free(c->hist[0]);
+		memmove(c->hist, c->hist + 1, (HIST_MAX - 1) * sizeof(c->hist[0]));
+		c->hist_count--;
+	}
+	c->hist[c->hist_count++] = entry;
+}
+
+static void history_up(Channel *c)
+{
+	if (c->hist_pos == 0) {
+		bell(c);
+		return;
+	}
+	if (c->hist_pos == c->hist_count) {
+		memcpy(c->hist_saved, c->line, c->line_len);
+		c->hist_saved_len = c->line_len;
+	}
+	c->hist_pos--;
+	line_set(c, c->hist[c->hist_pos], strlen(c->hist[c->hist_pos]));
+}
+
+static void history_down(Channel *c)
+{
+	if (c->hist_pos >= c->hist_count) {
+		bell(c);
+		return;
+	}
+	c->hist_pos++;
+	if (c->hist_pos == c->hist_count)
+		line_set(c, c->hist_saved, c->hist_saved_len);
+	else
+		line_set(c, c->hist[c->hist_pos], strlen(c->hist[c->hist_pos]));
+}
+
+static void history_free(Channel *c)
+{
+	int i;
+	for (i = 0; i < c->hist_count; i++) {
+		SecureZeroMemory(c->hist[i], strlen(c->hist[i]));
+		free(c->hist[i]);
+		c->hist[i] = NULL;
+	}
+	c->hist_count = 0;
+}
+
+/* ------------------------------------------------------------------ Tab completion */
+
+/* Characters that force cmd.exe to need quotes around a file name. */
+static int needs_quotes(const char *s)
+{
+	return strpbrk(s, " &()[]{}^=;!'+,`~") != NULL;
+}
+
+static int __cdecl comp_cmp(const void *a, const void *b)
+{
+	return _stricmp(*(char * const *)a, *(char * const *)b);
+}
+
+/* Current directory from the last prompt ("C:\Data\Users>"), or 0. */
+static int prompt_cwd(Channel *c, char *out, size_t out_size)
+{
+	size_t n;
+	int    ok = 0;
+
+	EnterCriticalSection(&c->echo_lock);
+	n = c->out_line_len;
+	if (!c->out_line_overflow && n >= 4 && n - 1 < out_size &&
+		((c->out_line[0] | 0x20) >= 'a' && (c->out_line[0] | 0x20) <= 'z') &&
+		c->out_line[1] == ':' && c->out_line[2] == '\\' && c->out_line[n - 1] == '>') {
+		memcpy(out, c->out_line, n - 1);
+		out[n - 1] = '\0';
+		ok = 1;
+	}
+	LeaveCriticalSection(&c->echo_lock);
+	return ok;
+}
+
+/*
+ * Find the word before the cursor and collect the matching file names.
+ * Returns the number of matches.
+ */
+static int comp_begin(Channel *c)
+{
+	char     word[LINE_MAX];
+	char     cwd[OUT_LINE_MAX];
+	char     pattern[LINE_MAX + OUT_LINE_MAX + 4];
+	wchar_t  wpattern[LINE_MAX + OUT_LINE_MAX + 4];
+	wchar_t  wprefix[LINE_MAX];
+	const char *prefix;
+	size_t   i, start = 0, wn = 0, dir_len = 0, prefix_wlen, arena_used = 0;
+	int      in_quote = 0, quoted = 0, have_cwd;
+	HANDLE   hFind;
+	WIN32_FIND_DATAW fd;
+
+	/* Word start: after the last space outside quotes */
+	for (i = 0; i < c->cursor; i++) {
+		if (c->line[i] == '"') in_quote = !in_quote;
+		else if (c->line[i] == ' ' && !in_quote) start = i + 1;
+	}
+	/* Unquoted copy of the word */
+	for (i = start; i < c->cursor; i++) {
+		if (c->line[i] == '"') quoted = 1;
+		else word[wn++] = c->line[i];
+	}
+	word[wn] = '\0';
+
+	/* Split into directory part and name prefix */
+	for (i = 0; i < wn; i++)
+		if (word[i] == '\\' || word[i] == '/' || word[i] == ':') dir_len = i + 1;
+	memcpy(c->comp_dir, word, dir_len);
+	c->comp_dir[dir_len] = '\0';
+	prefix = word + dir_len;
+
+	/* Base directory for relative words */
+	have_cwd = prompt_cwd(c, cwd, sizeof(cwd));
+	if (wn >= 2 && word[1] == ':') {
+		pattern[0] = '\0';                          /* C:\... absolute */
+	} else if (wn >= 2 && word[0] == '\\' && word[1] == '\\') {
+		pattern[0] = '\0';                          /* \\server\share */
+	} else if (!have_cwd) {
+		return 0;
+	} else if (wn >= 1 && (word[0] == '\\' || word[0] == '/')) {
+		_snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%.2s", cwd);   /* root of the drive */
+	} else {
+		size_t cl = strlen(cwd);
+		_snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s%s", cwd,
+			(cl > 0 && cwd[cl - 1] == '\\') ? "" : "\\");
+	}
+	strncat_s(pattern, sizeof(pattern), word, _TRUNCATE);
+	strncat_s(pattern, sizeof(pattern), "*", _TRUNCATE);
+
+	if (MultiByteToWideChar(CP_UTF8, 0, pattern, -1, wpattern, _countof(wpattern)) == 0)
+		return 0;
+	if (MultiByteToWideChar(CP_UTF8, 0, prefix, -1, wprefix, _countof(wprefix)) == 0)
+		return 0;
+	prefix_wlen = wcslen(wprefix);
+
+	c->comp_count = 0;
+	hFind = FindFirstFileExW(wpattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, 0);
+	if (hFind == INVALID_HANDLE_VALUE) return 0;
+	do {
+		char name[MAX_PATH * 3 + 1];
+		int  nl;
+		if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+		/* "x*" also matches 8.3 short names: keep long names with the prefix only */
+		if (_wcsnicmp(fd.cFileName, wprefix, prefix_wlen) != 0) continue;
+		nl = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof(name), NULL, NULL);
+		if (nl <= 0 || arena_used + (size_t)nl > COMP_ARENA) continue;
+		memcpy(c->comp_arena + arena_used, name, (size_t)nl);
+		c->comp_names[c->comp_count++] = c->comp_arena + arena_used;
+		arena_used += (size_t)nl;
+	} while (c->comp_count < COMP_MAX && FindNextFileW(hFind, &fd));
+	FindClose(hFind);
+
+	qsort(c->comp_names, (size_t)c->comp_count, sizeof(c->comp_names[0]), comp_cmp);
+	c->comp_quote = quoted;
+	c->comp_start = start;
+	c->comp_end = c->cursor;
+	return c->comp_count;
+}
+
+/* Replace the word with the current match. */
+static void comp_apply(Channel *c)
+{
+	char   text[LINE_MAX + MAX_PATH * 3 + 4];
+	size_t tn, tail, old_cols;
+	int    quote;
+
+	_snprintf_s(text, sizeof(text), _TRUNCATE, "%s%s", c->comp_dir, c->comp_names[c->comp_index]);
+	quote = c->comp_quote || needs_quotes(text);
+	_snprintf_s(text, sizeof(text), _TRUNCATE, "%s%s%s%s", quote ? "\"" : "",
+		c->comp_dir, c->comp_names[c->comp_index], quote ? "\"" : "");
+	tn = strlen(text);
+
+	tail = c->line_len - c->comp_end;
+	if (c->comp_start + tn + tail > LINE_MAX - 2) {
+		bell(c);
+		return;
+	}
+	term_move(c, -(int)line_cols(c, c->comp_start, c->cursor));
+	old_cols = line_cols(c, c->comp_start, c->line_len);
+	memmove(c->line + c->comp_start + tn, c->line + c->comp_end, tail);
+	memcpy(c->line + c->comp_start, text, tn);
+	c->line_len = c->comp_start + tn + tail;
+	c->comp_end = c->comp_start + tn;
+	c->cursor = c->comp_end;
+	refresh_tail(c, c->comp_start, old_cols);
+}
+
+/* Tab (dir = +1) / Shift-Tab (dir = -1) */
+static void complete(Channel *c, int dir)
+{
+	if (!c->comp_active) {
+		if (comp_begin(c) == 0) {
+			bell(c);
+			return;
+		}
+		c->comp_active = 1;
+		c->comp_index = dir > 0 ? 0 : c->comp_count - 1;
+	} else {
+		c->comp_index = (c->comp_index + dir + c->comp_count) % c->comp_count;
+	}
+	comp_apply(c);
+}
+
+/* ------------------------------------------------------------------ submit */
+
 /* Queue the expected echo of a submitted line, then send it to the shell. */
 static void submit_line(Channel *c)
 {
+	history_add(c);
+	c->hist_pos = c->hist_count;
+
 	EnterCriticalSection(&c->echo_lock);
 	/* If an earlier echo is still pending, typing ahead broke the pattern:
 	 * give up on filtering rather than mismatching. */
@@ -465,16 +891,58 @@ static void submit_line(Channel *c)
 	c->line[c->line_len++] = '\n';
 	shell_write(c, c->line, c->line_len);
 	c->line_len = 0;
+	c->cursor = 0;
 }
 
-static void erase_last_char(Channel *c)
+/* ------------------------------------------------------------------ keys */
+
+/* Final byte of "ESC [ <param> <final>" or "ESC O <final>". */
+static void handle_escape(Channel *c, unsigned char final, int param)
 {
-	if (c->line_len == 0) return;
-	/* Remove a whole UTF-8 sequence (continuation bytes are 10xxxxxx) */
-	do {
-		c->line_len--;
-	} while (c->line_len > 0 && ((unsigned char)c->line[c->line_len] & 0xC0) == 0x80);
-	channel_echo(c, "\b \b", 3);
+	if (final != 'Z') c->comp_active = 0;
+
+	switch (final) {
+	case 'A': history_up(c);     break;
+	case 'B': history_down(c);   break;
+	case 'C': cursor_right(c);   break;
+	case 'D': cursor_left(c);    break;
+	case 'H': cursor_home(c);    break;
+	case 'F': cursor_end(c);     break;
+	case 'Z': complete(c, -1);   break;   /* Shift-Tab */
+	case '~':
+		switch (param) {
+		case 1: case 7: cursor_home(c);      break;
+		case 4: case 8: cursor_end(c);       break;
+		case 3:         delete_at_cursor(c); break;
+		}
+		break;
+	}
+}
+
+/* Printable byte: complete UTF-8 sequences before inserting them. */
+static void handle_printable(Channel *c, unsigned char ch)
+{
+	if (ch < 0x80) {
+		c->utf8_need = 0;
+		line_insert(c, (const char *)&ch, 1);
+		return;
+	}
+	if ((ch & 0xC0) == 0x80) {                 /* continuation byte */
+		if (c->utf8_need == 0) return;
+		c->utf8_pend[c->utf8_have++] = (char)ch;
+		if (c->utf8_have == c->utf8_need) {
+			c->utf8_need = 0;
+			line_insert(c, c->utf8_pend, (size_t)c->utf8_have);
+		}
+		return;
+	}
+	if (ch >= 0xF8) {                          /* invalid lead byte */
+		c->utf8_need = 0;
+		return;
+	}
+	c->utf8_pend[0] = (char)ch;
+	c->utf8_have = 1;
+	c->utf8_need = ch >= 0xF0 ? 4 : ch >= 0xE0 ? 3 : 2;
 }
 
 static void handle_input(Channel *c, const uint8_t *data, size_t len)
@@ -493,19 +961,33 @@ static void handle_input(Channel *c, const uint8_t *data, size_t len)
 		int           was_cr = c->last_was_cr;
 		c->last_was_cr = 0;
 
-		/* Swallow terminal escape sequences (arrows, function keys...) */
+		/* Terminal escape sequences (arrows, Home/End, Delete, Shift-Tab...) */
 		if (c->esc_state == 1) {
+			c->esc_param = 0;
+			c->esc_param_done = 0;
 			c->esc_state = (ch == '[') ? 2 : (ch == 'O') ? 3 : 0;
 			continue;
 		}
 		if (c->esc_state == 2) {
-			if (ch >= 0x40 && ch <= 0x7e) c->esc_state = 0;
+			if (ch >= '0' && ch <= '9') {
+				if (!c->esc_param_done && c->esc_param < 1000)
+					c->esc_param = c->esc_param * 10 + (ch - '0');
+			} else if (ch == ';') {
+				c->esc_param_done = 1;
+			} else if (ch >= 0x40 && ch <= 0x7e) {
+				c->esc_state = 0;
+				handle_escape(c, ch, c->esc_param);
+			}
 			continue;
 		}
 		if (c->esc_state == 3) {
 			c->esc_state = 0;
+			handle_escape(c, ch, 0);
 			continue;
 		}
+
+		if (ch != '\t' && ch != 0x1b) c->comp_active = 0;
+		if (ch < 0x80) c->utf8_need = 0;
 
 		switch (ch) {
 		case 0x1b:                  /* ESC */
@@ -520,13 +1002,24 @@ static void handle_input(Channel *c, const uint8_t *data, size_t len)
 			break;
 		case 0x7f:                  /* DEL (usual backspace key) */
 		case 0x08:                  /* BS */
-			erase_last_char(c);
+			delete_before_cursor(c);
+			break;
+		case 0x01:                  /* Ctrl-A: start of line */
+			cursor_home(c);
+			break;
+		case 0x05:                  /* Ctrl-E: end of line */
+			cursor_end(c);
 			break;
 		case 0x15:                  /* Ctrl-U: erase line */
-			while (c->line_len > 0) erase_last_char(c);
+			line_set(c, "", 0);
+			break;
+		case '\t':
+			complete(c, +1);
 			break;
 		case 0x03:                  /* Ctrl-C: discard line, ask for a new prompt */
+			cursor_end(c);
 			c->line_len = 0;
+			c->cursor = 0;
 			channel_echo(c, "^C", 2);
 			submit_line(c);
 			break;
@@ -535,15 +1028,9 @@ static void handle_input(Channel *c, const uint8_t *data, size_t len)
 				shell_close_stdin(c);
 			}
 			break;
-		case '\t':
-			ch = ' ';
-			/* fall through */
 		default:
 			if (ch < 0x20) break;   /* other control characters: ignore */
-			if (c->line_len < LINE_MAX - 2) {
-				c->line[c->line_len++] = (char)ch;
-				channel_echo(c, (const char *)&ch, 1);
-			}
+			handle_printable(c, ch);
 			break;
 		}
 	}
@@ -818,6 +1305,7 @@ done:
 	if (c->hProcess) CloseHandle(c->hProcess);
 	if (c->window_event) CloseHandle(c->window_event);
 	DeleteCriticalSection(&c->echo_lock);
+	history_free(c);
 
 	SecureZeroMemory(c, sizeof(*c));
 	free(c);

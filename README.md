@@ -24,7 +24,10 @@ Tested with the following SSH client:
 
 ## Features
 
-- Interactive shell (`cmd.exe` by default) with local echo and line editing (backspace, Ctrl-U, Ctrl-C, Ctrl-D)
+- Interactive shell (`cmd.exe` by default) with local echo and line editing:
+  - cursor movement with Left/Right, Home/End (or Ctrl-A/Ctrl-E), Backspace/Delete, Ctrl-U, Ctrl-C, Ctrl-D
+  - command history (last 32 lines) with Up/Down
+  - Tab / Shift-Tab cycles through matching file and directory names, like the Windows console (the current directory is read from cmd's prompt, so keep the default `PROMPT`)
 - Several simultaneous sessions (default 4, configurable)
 - Ed25519 host key generated on first start and stored in the registry
 - `authorized_keys` file in OpenSSH format, re-read at each login (no restart needed)
