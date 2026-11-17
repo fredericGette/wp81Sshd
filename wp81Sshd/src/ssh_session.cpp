@@ -17,6 +17,10 @@
  * out of its output.  The current directory used for completion is taken
  * from the last prompt cmd printed ("C:\Data>").
  *
+ * An "exec" request (other than scp) runs "<shell> /s /c <command>" in the
+ * home directory on the same pipes and pump, with no echo filtering; without
+ * a PTY its stderr has its own pipe and is sent as extended data.
+ *
  * Instead of a shell, the channel can carry a file transfer (ssh_files.cpp):
  * the "sftp" subsystem, or an "scp -t/-f" exec request.  Its data is queued
  * by the session thread and consumed by a worker thread, which re-opens the
@@ -112,12 +116,14 @@ typedef struct {
 	char      *comp_names[COMP_MAX];
 	char       comp_arena[COMP_ARENA];
 
-	/* shell process */
+	/* shell process (interactive shell or exec command) */
 	int        shell_started;
+	int        exec;                 /* the process runs an exec command ("cmd /c") */
 	HANDLE     hProcess;
 	HANDLE     hJob;                 /* kill-on-close job: ends the whole process tree */
 	HANDLE     hStdinWr;             /* our end of the child's stdin */
-	HANDLE     hStdoutRd;            /* our end of the child's stdout+stderr */
+	HANDLE     hStdoutRd;            /* our end of the child's stdout (+stderr if merged) */
+	HANDLE     hStderrRd;            /* our end of a separate stderr pipe, or NULL */
 	HANDLE     hPump;
 
 	/* echo filter (shared session thread <-> pump thread) */
@@ -213,10 +219,11 @@ static void channel_send_close(Channel *c)
 }
 
 /*
- * Send up to `len` bytes as CHANNEL_DATA without waiting for window space.
+ * Send up to `len` bytes as CHANNEL_DATA (or, if `ext`, as EXTENDED_DATA of
+ * type stderr) without waiting for window space.
  * Returns bytes sent (possibly 0), or -1 on error.
  */
-static int channel_send_some(Channel *c, const uint8_t *data, size_t len)
+static int channel_send_some(Channel *c, const uint8_t *data, size_t len, int ext)
 {
 	uint8_t pkt[LOCAL_MAX_PACKET + 16];
 	size_t  n, off = 0;
@@ -236,8 +243,9 @@ static int channel_send_some(Channel *c, const uint8_t *data, size_t len)
 		return 0;
 	}
 
-	buf_put_byte(pkt, sizeof(pkt), &off, SSH_MSG_CHANNEL_DATA);
+	buf_put_byte(pkt, sizeof(pkt), &off, ext ? SSH_MSG_CHANNEL_EXTENDED_DATA : SSH_MSG_CHANNEL_DATA);
 	buf_put_u32_at(pkt, sizeof(pkt), &off, c->remote_id);
+	if (ext) buf_put_u32_at(pkt, sizeof(pkt), &off, SSH_EXTENDED_DATA_STDERR);
 	buf_put_string(pkt, sizeof(pkt), &off, data, n);
 	rc = ssh_send_packet(c->s, pkt, off);
 	if (rc == 0) c->remote_window -= (uint32_t)n;
@@ -247,12 +255,12 @@ static int channel_send_some(Channel *c, const uint8_t *data, size_t len)
 
 /* Send all bytes, waiting for window adjustments.  Pump thread only.
  * Returns 0 on success, -1 if the session is closing or on error. */
-static int channel_send_all(Channel *c, const uint8_t *data, size_t len)
+static int channel_send_all(Channel *c, const uint8_t *data, size_t len, int ext)
 {
 	while (len > 0) {
 		int n;
 		if (c->s->closing) return -1;
-		n = channel_send_some(c, data, len);
+		n = channel_send_some(c, data, len, ext);
 		if (n < 0) return -1;
 		if (n == 0) {
 			api.WaitForSingleObject(c->window_event, 250);
@@ -271,7 +279,7 @@ static int channel_send_all(Channel *c, const uint8_t *data, size_t len)
 static void channel_echo(Channel *c, const char *data, size_t len)
 {
 	if (c->pty && len > 0)
-		channel_send_some(c, (const uint8_t *)data, len);
+		channel_send_some(c, (const uint8_t *)data, len, 0);
 }
 
 static void channel_send_exit_status(Channel *c, uint32_t code)
@@ -366,7 +374,7 @@ static int xfer_recv(void *ctx, uint8_t *buf, size_t len)
 /* XferIO.send (worker thread) */
 static int xfer_send(void *ctx, const uint8_t *buf, size_t len)
 {
-	return channel_send_all((Channel *)ctx, buf, len);
+	return channel_send_all((Channel *)ctx, buf, len, 0);
 }
 
 static DWORD WINAPI xfer_thread(LPVOID param)
@@ -414,57 +422,102 @@ static int xfer_launch(Channel *c)
 
 /* ================================================================== shell process */
 
-static int shell_spawn(Channel *c)
+/*
+ * Start the shell (cmd_utf8 == NULL) or an exec command, run as
+ * "<shell> /s /c "<command>"" in the home directory.  Without a PTY, an exec
+ * command gets a separate stderr pipe (sent as extended data); otherwise
+ * stderr is merged into stdout.
+ */
+#define CMDLINE_MAX (MAX_PATH + EXEC_CMD_MAX + 16)
+
+static int process_spawn(Channel *c, const char *cmd_utf8)
 {
 	SECURITY_ATTRIBUTES sa = {};
-	HANDLE  hInRd = NULL, hInWr = NULL, hOutRd = NULL, hOutWr = NULL;
-	wchar_t cmdline[MAX_PATH];
-	BOOL    launched;
+	HANDLE   hInRd = NULL, hInWr = NULL, hOutRd = NULL, hOutWr = NULL;
+	HANDLE   hErrRd = NULL, hErrWr = NULL;
+	wchar_t *cmdline;
+	const wchar_t *cwd = NULL;
+	BOOL     launched, pipes_ok;
+	int      separate_stderr = cmd_utf8 && !c->pty;
 	PROCESS_INFORMATION pi = {};
 	STARTUPINFOW si = {};
 
+	cmdline = (wchar_t *)malloc(CMDLINE_MAX * sizeof(wchar_t));
+	if (!cmdline) return -1;
+
+	if (!cmd_utf8) {
+		wcscpy_s(cmdline, CMDLINE_MAX, c->s->shell_command);
+	} else {
+		size_t pre;
+		int    n;
+		if (!cmd_utf8[0]) {
+			free(cmdline);
+			return -1;
+		}
+		/* /s: cmd removes only the outer quotes, so the command's own quotes survive */
+		_snwprintf_s(cmdline, CMDLINE_MAX, _TRUNCATE, L"\"%s\" /s /c \"", c->s->shell_command);
+		pre = wcslen(cmdline);
+		n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cmd_utf8, -1,
+			cmdline + pre, (int)(CMDLINE_MAX - pre - 1));
+		if (n <= 0) {
+			LOGF(TRACE_LEVEL_WARNING, "[%u] exec command is not valid UTF-8 or too long", c->s->id);
+			free(cmdline);
+			return -1;
+		}
+		wcscat_s(cmdline, CMDLINE_MAX, L"\"");
+		if (c->s->home_dir[0]) cwd = c->s->home_dir;
+	}
+
 	sa.nLength = sizeof(sa);
 	sa.bInheritHandle = TRUE;
-	wcscpy_s(cmdline, MAX_PATH, c->s->shell_command);
 
 	spawn_lock_init();
 	EnterCriticalSection(&g_spawnLock);
 
-	if (!CreatePipe(&hInRd, &hInWr, &sa, STDIN_PIPE_SIZE) ||
-		!CreatePipe(&hOutRd, &hOutWr, &sa, 0)) {
+	pipes_ok = CreatePipe(&hInRd, &hInWr, &sa, STDIN_PIPE_SIZE) &&
+		CreatePipe(&hOutRd, &hOutWr, &sa, 0) &&
+		(!separate_stderr || CreatePipe(&hErrRd, &hErrWr, &sa, 0));
+	if (!pipes_ok) {
 		LOGF(TRACE_LEVEL_ERROR, "[%u] CreatePipe failed: %lu", c->s->id, GetLastError());
 		LeaveCriticalSection(&g_spawnLock);
 		if (hInRd) CloseHandle(hInRd);
 		if (hInWr) CloseHandle(hInWr);
 		if (hOutRd) CloseHandle(hOutRd);
 		if (hOutWr) CloseHandle(hOutWr);
+		if (hErrRd) CloseHandle(hErrRd);
+		if (hErrWr) CloseHandle(hErrWr);
+		free(cmdline);
 		return -1;
 	}
 
 	/* Our ends must not be inherited */
 	SetHandleInformation(hInWr, HANDLE_FLAG_INHERIT, 0);
 	SetHandleInformation(hOutRd, HANDLE_FLAG_INHERIT, 0);
+	if (hErrRd) SetHandleInformation(hErrRd, HANDLE_FLAG_INHERIT, 0);
 
 	si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
 	si.wShowWindow = SW_HIDE;
 	si.hStdInput = hInRd;
 	si.hStdOutput = hOutWr;
-	si.hStdError = hOutWr;   /* stderr merged into stdout */
+	si.hStdError = hErrWr ? hErrWr : hOutWr;   /* else stderr merged into stdout */
 
 	launched = api.CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-		NULL, NULL, &si, &pi);
+		NULL, cwd, &si, &pi);
 
 	/* Close the child's ends in this process (also on failure) */
 	CloseHandle(hInRd);
 	CloseHandle(hOutWr);
+	if (hErrWr) CloseHandle(hErrWr);
 	LeaveCriticalSection(&g_spawnLock);
 
 	if (!launched) {
 		LOGF(TRACE_LEVEL_ERROR, "[%u] CreateProcess '%S' failed: %lu",
-			c->s->id, c->s->shell_command, GetLastError());
+			c->s->id, cmdline, GetLastError());
 		CloseHandle(hInWr);
 		CloseHandle(hOutRd);
+		if (hErrRd) CloseHandle(hErrRd);
+		free(cmdline);
 		return -1;
 	}
 
@@ -489,9 +542,11 @@ static int shell_spawn(Channel *c)
 	c->hProcess = pi.hProcess;
 	c->hStdinWr = hInWr;
 	c->hStdoutRd = hOutRd;
+	c->hStderrRd = hErrRd;
 	c->shell_started = 1;
-	LOGF(TRACE_LEVEL_INFORMATION, "[%u] shell started: %S (pid %lu)",
-		c->s->id, c->s->shell_command, pi.dwProcessId);
+	LOGF(TRACE_LEVEL_INFORMATION, "[%u] %s started: %S (pid %lu)",
+		c->s->id, cmd_utf8 ? "exec" : "shell", cmdline, pi.dwProcessId);
+	free(cmdline);
 	return 0;
 }
 
@@ -567,7 +622,7 @@ static int pump_forward(Channel *c, const char *in, size_t len)
 	track_out_line(c, out, n);
 	LeaveCriticalSection(&c->echo_lock);
 
-	return channel_send_all(c, (const uint8_t *)out, n);
+	return channel_send_all(c, (const uint8_t *)out, n, 0);
 }
 
 /* Release swallowed echo bytes if the rest never came. */
@@ -586,48 +641,76 @@ static int pump_flush_stale_echo(Channel *c, int force)
 	}
 	LeaveCriticalSection(&c->echo_lock);
 
-	return n ? channel_send_all(c, (const uint8_t *)held, n) : 0;
+	return n ? channel_send_all(c, (const uint8_t *)held, n, 0) : 0;
 }
 
 /* Read whatever is available in the pipe (never blocks). 1 = data read,
  * 0 = nothing available, -1 = pipe broken (all writers gone). */
-static int pump_read(Channel *c, char *buf, size_t size, DWORD *got)
+static int pump_read(HANDLE h, char *buf, size_t size, DWORD *got)
 {
 	DWORD avail = 0;
 	*got = 0;
-	if (!api.PeekNamedPipe(c->hStdoutRd, NULL, 0, NULL, &avail, NULL)) return -1;
+	if (!api.PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1;
 	if (avail == 0) return 0;
 	if (avail > size) avail = (DWORD)size;
-	if (!ReadFile(c->hStdoutRd, buf, avail, got, NULL) || *got == 0) return -1;
+	if (!ReadFile(h, buf, avail, got, NULL) || *got == 0) return -1;
 	return 1;
+}
+
+/* Forward what is available on stdout, then on stderr (if separate).
+ * Returns 1 if data was forwarded, 0 if none, -1 on send error.
+ * Sets *out_broken / *err_broken once that pipe has lost all its writers. */
+static int pump_once(Channel *c, char *buf, size_t size, int *out_broken, int *err_broken)
+{
+	DWORD got;
+	int   r, any = 0;
+
+	if (!*out_broken) {
+		r = pump_read(c->hStdoutRd, buf, size, &got);
+		if (r > 0) {
+			if (pump_forward(c, buf, got) != 0) return -1;
+			any = 1;
+		} else if (r < 0) {
+			*out_broken = 1;
+		}
+	}
+	if (!*err_broken) {
+		r = pump_read(c->hStderrRd, buf, size, &got);
+		if (r > 0) {
+			if (channel_send_all(c, (const uint8_t *)buf, got, 1) != 0) return -1;
+			any = 1;
+		} else if (r < 0) {
+			*err_broken = 1;
+		}
+	}
+	return any;
 }
 
 static DWORD WINAPI pump_thread(LPVOID param)
 {
 	Channel *c = (Channel *)param;
 	char     buf[8192];
-	DWORD    got;
 	DWORD    exit_code = 0;
 	int      exited = 0;
+	int      out_broken = 0, err_broken = (c->hStderrRd == NULL);
 
 	for (;;) {
-		int r;
+		int r, broken;
 		if (c->s->closing) return 0;
 
-		r = pump_read(c, buf, sizeof(buf), &got);
-		if (r > 0) {
-			if (pump_forward(c, buf, got) != 0) return 0;
-			continue;
-		}
+		r = pump_once(c, buf, sizeof(buf), &out_broken, &err_broken);
+		if (r < 0) return 0;
+		if (r > 0) continue;
 		if (pump_flush_stale_echo(c, 0) != 0) return 0;
 
-		if (r < 0 || api.WaitForSingleObject(c->hProcess, PUMP_POLL_MS) == WAIT_OBJECT_0) {
-			/* Process exited (or every writer closed the pipe): drain what is left.
-			 * A grandchild may still hold the pipe open, so do not block. */
-			while (pump_read(c, buf, sizeof(buf), &got) > 0)
-				if (pump_forward(c, buf, got) != 0) return 0;
+		broken = out_broken && err_broken;
+		if (broken || api.WaitForSingleObject(c->hProcess, PUMP_POLL_MS) == WAIT_OBJECT_0) {
+			/* Process exited (or every writer closed the pipes): drain what is left.
+			 * A grandchild may still hold a pipe open, so do not block. */
+			while ((r = pump_once(c, buf, sizeof(buf), &out_broken, &err_broken)) > 0) {}
+			if (r < 0) return 0;
 			if (pump_flush_stale_echo(c, 1) != 0) return 0;
-			if (r < 0)
+			if (broken)
 				api.WaitForSingleObject(c->hProcess, 2000);
 			exited = GetExitCodeProcess(c->hProcess, &exit_code) && exit_code != STILL_ACTIVE;
 			break;
@@ -635,7 +718,8 @@ static DWORD WINAPI pump_thread(LPVOID param)
 	}
 
 	if (c->s->closing) return 0;
-	LOGF(TRACE_LEVEL_INFORMATION, "[%u] shell exited with code %lu", c->s->id, exit_code);
+	LOGF(TRACE_LEVEL_INFORMATION, "[%u] %s exited with code %lu", c->s->id,
+		c->exec ? "exec command" : "shell", exit_code);
 
 	/* exit-status, then EOF + CLOSE */
 	if (exited) channel_send_exit_status(c, exit_code);
@@ -1026,8 +1110,9 @@ static void submit_line(Channel *c)
 
 	EnterCriticalSection(&c->echo_lock);
 	/* If an earlier echo is still pending, typing ahead broke the pattern:
-	 * give up on filtering rather than mismatching. */
-	if (c->echo_len == 0) {
+	 * give up on filtering rather than mismatching.  An exec command ("cmd /c")
+	 * does not echo what it reads, so there is nothing to filter. */
+	if (c->echo_len == 0 && !c->exec) {
 		memcpy(c->echo_expect, c->line, c->line_len);
 		c->echo_expect[c->line_len] = '\r';
 		c->echo_expect[c->line_len + 1] = '\n';
@@ -1236,6 +1321,18 @@ static int handle_channel_open(Channel *c, const uint8_t *buf, size_t len)
 	return ssh_send_packet(c->s, pkt, poff);
 }
 
+/* Start the output pump of a freshly spawned process (after the request was
+ * answered).  On failure the process is left to the session cleanup. */
+static int start_pump(Channel *c)
+{
+	c->hPump = CreateThread(NULL, 0, pump_thread, c, 0, NULL);
+	if (!c->hPump) {
+		LOGF(TRACE_LEVEL_ERROR, "[%u] CreateThread (pump) failed: %lu", c->s->id, GetLastError());
+		return -1;
+	}
+	return 0;
+}
+
 static int handle_channel_request(Channel *c, const uint8_t *buf, size_t len)
 {
 	size_t         off = 1;
@@ -1260,6 +1357,7 @@ static int handle_channel_request(Channel *c, const uint8_t *buf, size_t len)
 		size_t         arg_len;
 		char           cmd[EXEC_CMD_MAX];
 		int            ok = 0, is_exec = buf_eq(type, type_len, "exec");
+		int            is_command = 0;   /* exec run by the shell (not a transfer) */
 
 		if (buf_get_string(buf, len, &off, &arg, &arg_len) != 0) return -1;
 		if (arg_len >= sizeof(cmd) || memchr(arg, 0, arg_len)) arg_len = 0;
@@ -1267,15 +1365,22 @@ static int handle_channel_request(Channel *c, const uint8_t *buf, size_t len)
 		cmd[arg_len] = '\0';
 
 		if (!c->shell_started && !c->xfer) {
-			if (!is_exec && strcmp(cmd, "sftp") == 0)
+			if (!is_exec && strcmp(cmd, "sftp") == 0) {
 				ok = xfer_prepare(c, 1, NULL) == 0;
-			else if (is_exec && scp_is_command(cmd))
+			} else if (is_exec && scp_is_command(cmd)) {
 				ok = xfer_prepare(c, 2, cmd) == 0;
+			} else if (is_exec && cmd[0]) {
+				is_command = 1;
+				c->exec = 1;
+				ok = process_spawn(c, cmd) == 0;
+				if (!ok) c->exec = 0;
+			}
 			if (!ok) c->xfer = 0;
 		}
 		if (!ok)
 			LOGF(TRACE_LEVEL_INFORMATION, "[%u] declined %s '%s'", c->s->id, is_exec ? "exec" : "subsystem", cmd);
 		if (want_reply && send_request_reply(c, ok) != 0) return -1;
+		if (ok && is_command) return start_pump(c);
 		if (ok && xfer_launch(c) != 0) {
 			channel_send_close(c);
 			return 0;
@@ -1284,16 +1389,9 @@ static int handle_channel_request(Channel *c, const uint8_t *buf, size_t len)
 	}
 
 	if (buf_eq(type, type_len, "shell")) {
-		int ok = !c->shell_started && !c->xfer && shell_spawn(c) == 0;
+		int ok = !c->shell_started && !c->xfer && process_spawn(c, NULL) == 0;
 		if (want_reply && send_request_reply(c, ok) != 0) return -1;
-		if (ok) {
-			c->hPump = CreateThread(NULL, 0, pump_thread, c, 0, NULL);
-			if (!c->hPump) {
-				LOGF(TRACE_LEVEL_ERROR, "[%u] CreateThread (pump) failed: %lu", c->s->id, GetLastError());
-				return -1;
-			}
-		}
-		return 0;
+		return ok ? start_pump(c) : 0;
 	}
 
 	/* window-change, env, signal, exec, subsystem, x11-req, agent forwarding... */
@@ -1507,6 +1605,7 @@ done:
 	DeleteCriticalSection(&c->q_lock);
 	shell_close_stdin(c);
 	if (c->hStdoutRd) CloseHandle(c->hStdoutRd);
+	if (c->hStderrRd) CloseHandle(c->hStderrRd);
 	if (c->hProcess) CloseHandle(c->hProcess);
 	if (c->window_event) CloseHandle(c->window_event);
 	DeleteCriticalSection(&c->echo_lock);

@@ -48,6 +48,7 @@
 #define SSH_MSG_CHANNEL_WINDOW_ADJUST   93
 #define SSH_MSG_CHANNEL_DATA            94
 #define SSH_MSG_CHANNEL_EXTENDED_DATA   95
+#define SSH_EXTENDED_DATA_STDERR        1
 #define SSH_MSG_CHANNEL_EOF             96
 #define SSH_MSG_CHANNEL_CLOSE           97
 #define SSH_MSG_CHANNEL_REQUEST         98

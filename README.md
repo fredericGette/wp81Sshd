@@ -1,7 +1,7 @@
 # wp81Sshd
 
 A minimal SSH-2 **server** running as a Win32 service on **Windows Phone 8.1**.  
-It gives every SSH client an interactive `cmd.exe`, as an encrypted and key-authenticated replacement for the telnet server.
+It gives every SSH client an interactive `cmd.exe`, remote command execution (`ssh phone <command>`) and file transfer (`scp`/`sftp`), as an encrypted and key-authenticated replacement for the telnet server.
 
 Built from the same self-contained crypto as the [wp81ssh](https://github.com/fredericGette/wp81ssh) client (no external libraries), with the service structure of [wp81TimerService](https://github.com/fredericGette/wp81TimerService).
 
@@ -28,6 +28,7 @@ Tested with the following SSH client:
   - cursor movement with Left/Right, Home/End (or Ctrl-A/Ctrl-E), Backspace/Delete, Ctrl-U, Ctrl-C, Ctrl-D
   - command history (last 32 lines) with Up/Down
   - Tab / Shift-Tab cycles through matching file and directory names, like the Windows console (the current directory is read from cmd's prompt, so keep the default `PROMPT`)
+- Remote commands: `ssh user@<phone-ip> dir C:\Data` runs the command with `cmd.exe /c` in the home directory; stdout and stderr are kept separate and the exit code is returned to the client. `ssh -t` adds line editing for commands that read input.
 - File transfer with `scp` in both directions, including whole directories (`scp -r`), with both the SFTP protocol (default of OpenSSH ≥ 9.0) and the legacy SCP protocol (`scp -O`, older clients). `sftp` works too.
 - Several simultaneous sessions (default 4, configurable)
 - Ed25519 host key generated on first start and stored in the registry
@@ -76,6 +77,16 @@ ssh user@<phone-ip>
 
 The user name is not checked (the phone has a single account); it is only written to the log.
 
+**Run a single command:**
+
+```bat
+ssh user@<phone-ip> dir C:\Data
+ssh user@<phone-ip> "ipconfig /all" > ipconfig.txt
+ssh user@<phone-ip> "dir missing" 2>errors.txt
+```
+
+The command runs as `cmd.exe /s /c "<command>"` (so cmd syntax such as `&`, `|`, `>` or `%VAR%` works) in the home directory, `C:\Data\USERS\Public\Documents` by default. Its exit code becomes the exit code of `ssh`.
+
 **Copy files:**
 
 ```bat
@@ -121,7 +132,7 @@ All values live under `HKLM\SYSTEM\CurrentControlSet\Services\wp81Sshd\Parameter
 | Maximum simultaneous sessions | `4` (max 16) | `MaxSessions` (REG_DWORD) |
 | authorized_keys file | `C:\Data\USERS\Public\Documents\wp81Sshd\authorized_keys` | `AuthorizedKeysFile` (REG_SZ) |
 | Shell | `C:\Windows\System32\cmd.exe` | `ShellCommand` (REG_SZ) |
-| Base of relative `scp`/`sftp` paths | `C:\Data\USERS\Public\Documents` | `HomeDirectory` (REG_SZ) |
+| Base of relative `scp`/`sftp` paths and working directory of remote commands | `C:\Data\USERS\Public\Documents` | `HomeDirectory` (REG_SZ) |
 | Log file | *(disabled)* | `LogFile` (REG_SZ) |
 | Host key | generated at first start | `HostKey` (REG_BINARY, 32-byte Ed25519 seed) |
 
@@ -164,10 +175,11 @@ Log levels: `CRIT`, `ERROR`, `WARN`, `INFO`, `VERB`.
 
 ## Limitations
 
-- Windows Phone 8.1 has no pseudo console: the shell runs on pipes. Line editing happens in the server (no command history, no tab completion), and full-screen programs do not work.
+- Windows Phone 8.1 has no pseudo console: the shell runs on pipes. Line editing, history and Tab completion happen in the server (see Features), and full-screen programs do not work.
 - Ctrl-C cannot interrupt a running command; it only discards the line being typed. Closing the session kills everything started from it.
-- `cmd.exe` output is passed through as-is, in the phone's OEM code page.
-- No `exec` requests other than scp (`ssh phone dir` is refused), no port forwarding, no re-keying (irrelevant for interactive sessions).
+- `cmd.exe` output (including remote commands) is passed through as-is, in the phone's OEM code page.
+- Remote commands are passed to `ShellCommand` as `/s /c "<command>"`, so it must be `cmd.exe` (or accept the same switches).
+- No port forwarding, no re-keying (irrelevant for typical session lengths).
 - File transfer: Unix permissions are not mapped (files appear as `0644`/`0755`, `0444` when read-only, and permissions sent by the client are ignored); no symbolic links; paths are limited to `MAX_PATH` (260 characters).
 - IPv4 only.
 - The service runs as LocalSystem: anyone whose key is in `authorized_keys` has full control of the phone. Keep in mind that the default `authorized_keys` location is writable through the USB shared folder.
