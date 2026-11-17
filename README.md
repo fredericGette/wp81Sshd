@@ -5,6 +5,10 @@ It gives every SSH client an interactive `cmd.exe`, remote command execution (`s
 
 Built from the same self-contained crypto as the [wp81ssh](https://github.com/fredericGette/wp81ssh) client (no external libraries), with the service structure of [wp81TimerService](https://github.com/fredericGette/wp81TimerService).
 
+Example of downloads with `scp`:  
+![scp](./Capture001.PNG)
+
+
 ---
 
 ### Supported Algorithms
