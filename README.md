@@ -3,9 +3,9 @@
 A minimal SSH-2 **server** running as a Win32 service on **Windows Phone 8.1**.  
 It gives every SSH client an interactive `cmd.exe`, remote command execution (`ssh phone <command>`) and file transfer (`scp`/`sftp`), as an encrypted and key-authenticated replacement for the telnet server.
 
-Built from the same self-contained crypto as the [wp81ssh](https://github.com/fredericGette/wp81ssh) client (no external libraries), with the service structure of [wp81TimerService](https://github.com/fredericGette/wp81TimerService).
+Built from the same self-contained crypto as the [wp81ssh](https://github.com/fredericGette/wp81ssh) client (no external libraries).
 
-Example of downloads with `scp`:  
+Example of `scp` execution from a Windows PC to downloads the drivers of the phone :  
 ![scp](./Capture001.PNG)
 
 
